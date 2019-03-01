@@ -54,6 +54,7 @@ namespace costmap_2d
 InflationLayer::InflationLayer()
   : inflation_radius_(0)
   , weight_(0)
+  , inflate_unknown_(false)
   , cell_inflation_radius_(0)
   , cached_cell_inflation_radius_(0)
   , dsrv_(NULL)
@@ -101,8 +102,9 @@ void InflationLayer::reconfigureCB(costmap_2d::InflationPluginConfig &config, ui
 {
   setInflationParameters(config.inflation_radius, config.cost_scaling_factor);
 
-  if (enabled_ != config.enabled) {
+  if (enabled_ != config.enabled || inflate_unknown_ != config.inflate_unknown) {
     enabled_ = config.enabled;
+    inflate_unknown_ = config.inflate_unknown;
     need_reinflation_ = true;
   }
 }
@@ -172,7 +174,7 @@ void InflationLayer::onFootprintChanged()
 void InflationLayer::updateCosts(costmap_2d::Costmap2D& master_grid, int min_i, int min_j, int max_i, int max_j)
 {
   boost::unique_lock < boost::recursive_mutex > lock(*inflation_access_);
-  if (!enabled_)
+  if (!enabled_ || (cell_inflation_radius_ == 0))
     return;
 
   // make sure the inflation list is empty at the beginning of the cycle (should always be true)
@@ -213,7 +215,7 @@ void InflationLayer::updateCosts(costmap_2d::Costmap2D& master_grid, int min_i, 
   // We use a map<distance, list> to emulate the priority queue used before, with a notable performance boost
 
   // Start with lethal obstacles: by definition distance is 0.0
-  auto& obs_bin = inflation_cells_[0.0];
+  std::vector<CellData>& obs_bin = inflation_cells_[0.0];
   for (int j = min_j; j < max_j; j++)
   {
     for (int i = min_i; i < max_i; i++)
@@ -229,12 +231,15 @@ void InflationLayer::updateCosts(costmap_2d::Costmap2D& master_grid, int min_i, 
 
   // Process cells by increasing distance; new cells are appended to the corresponding distance bin, so they
   // can overtake previously inserted but farther away cells
-  for (auto& dist_bin: inflation_cells_)
+  std::map<double, std::vector<CellData> >::iterator bin;
+  for (bin = inflation_cells_.begin(); bin != inflation_cells_.end(); ++bin)
   {
-    for (auto& current_cell: dist_bin.second)
+    for (int i = 0; i < bin->second.size(); ++i)
     {
       // process all cells at distance dist_bin.first
-      unsigned int index = current_cell.index_;
+      const CellData& cell = bin->second[i];
+
+      unsigned int index = cell.index_;
 
       // ignore if already visited
       if (seen_[index])
@@ -244,15 +249,15 @@ void InflationLayer::updateCosts(costmap_2d::Costmap2D& master_grid, int min_i, 
 
       seen_[index] = true;
 
-      unsigned int mx = current_cell.x_;
-      unsigned int my = current_cell.y_;
-      unsigned int sx = current_cell.src_x_;
-      unsigned int sy = current_cell.src_y_;
+      unsigned int mx = cell.x_;
+      unsigned int my = cell.y_;
+      unsigned int sx = cell.src_x_;
+      unsigned int sy = cell.src_y_;
 
       // assign the cost associated with the distance from an obstacle to the cell
       unsigned char cost = costLookup(mx, my, sx, sy);
       unsigned char old_cost = master_array[index];
-      if (old_cost == NO_INFORMATION && cost >= INSCRIBED_INFLATED_OBSTACLE)
+      if (old_cost == NO_INFORMATION && (inflate_unknown_ ? (cost > FREE_SPACE) : (cost >= INSCRIBED_INFLATED_OBSTACLE)))
         master_array[index] = cost;
       else
         master_array[index] = std::max(old_cost, cost);
